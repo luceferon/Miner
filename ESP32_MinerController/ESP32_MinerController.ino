@@ -1,13 +1,5 @@
 /*
- * ESP32-C6-N16 Miner Controller v2.2
- * Управление N майнерами (Antminer S19 stock / Whatsminer M50 BiXBiT / др.)
- *
- * v2.2:
- *  - Исправлен парсинг температур чипов (temp2_X / temp_chipX) и плат (tempX / temp_pcbX) на Antminer S19
- *  - Добавлена телеметрия по каждой хеш-плате (Chains: хешрейт, число чипов, HW ошибки, градиент температур)
- *  - Расширенный парсинг пулов (статус Alive/Dead, Stratum Active, URL, сложность, принятые шары)
- *  - Для WhatsMiner TCP 4028 вместо неподдерживаемой команды stats отправляется devs
- *  - Добавлены метрики энергоэффективности (J/TH), частоты чипов, HW Errors, Stale shares
+ * ESP32-C6-N16 Miner Controller v3
  */
 
 #include <vector>
@@ -339,7 +331,7 @@ struct MinerStatus {
   String    rebootResult = "";
   uint32_t  rebootTime = 0;
 
-  /* ---- Chains & Pools (v2.2) ---- */
+  /* ---- Chains & Pools (v3) ---- */
   uint16_t  freqAvg = 0;
   uint16_t  totalAcn = 0;
   uint8_t   chainCount = 0;
@@ -2284,7 +2276,7 @@ void setup() {
   delay(300);
   Log.println();
   Log.println(F("=========================================="));
-  Log.println(F(" ESP32-C6-N16  Miner Controller v2.2"));
+  Log.println(F(" ESP32-C6-N16  Miner Controller v3"));
   Log.println(F(" Chains + Pools + Smart DOM + Fix S19 Temp"));
   Log.println(F("=========================================="));
 

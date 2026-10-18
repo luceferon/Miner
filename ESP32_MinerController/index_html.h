@@ -1,6 +1,6 @@
 /*
  * index_html.h
- * Основной веб-интерфейс (дашборд) — STA режим (v2.2)
+ * Основной веб-интерфейс (дашборд) — STA режим (v3)
  */
 
 #pragma once
@@ -138,7 +138,7 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
 }
 </style></head><body>
 <header class="hdr">
-  <h1>⛏️ ESP32-C6 · Miner Control Panel <small style="font-size:12px;color:#616e88">v2.2</small></h1>
+  <h1>⛏️ ESP32-C6 · Miner Control Panel <small style="font-size:12px;color:#616e88">v3</small></h1>
   <div class="meta">
     <span>ESP: <b id="espIp">-</b></span>
     <span>Wi-Fi: <b id="espRssi">-</b> dBm</span>
@@ -259,7 +259,7 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
   </div>
 </div>
 
-<div class="ota"><span>⚙️ Прошивка: ESP32-C6-N16 Miner Controller v2.2</span>
+<div class="ota"><span>⚙️ Прошивка: ESP32-C6-N16 Miner Controller v3</span>
 <span>👉 <a href="/update">OTA обновление прошивки</a></span></div>
 
 <script>
