@@ -45,12 +45,12 @@ input:focus,select:focus{border-color:#88c0d0}
 
 <form action="/savewifi" method="POST">
   <label>Сеть Wi-Fi (SSID)</label>
-  <input id="ssid" name="ssid" placeholder="Введите SSID или выберите из списка" required>
+  <input id="ssid" name="ssid" maxlength="32" placeholder="Введите SSID или выберите из списка" required>
   <button type="button" class="scan-btn" id="scanBtn">🔍 Сканировать сети Wi-Fi поблизости</button>
   <div class="wifi-list" id="wifiList"></div>
 
   <label>Пароль Wi-Fi</label>
-  <input name="password" type="password" placeholder="Пароль сети (можно оставить пустым для открытой)">
+  <input name="password" type="password" maxlength="64" placeholder="Пароль сети (можно оставить пустым для открытой)">
 
   <div class="check"><input type="checkbox" id="st" name="static" onchange="document.getElementById('iprow').style.display=this.checked?'grid':'none'">
     <label for="st" style="all:unset;color:#b8c0d0;cursor:pointer">Использовать статический IP</label></div>
@@ -68,21 +68,28 @@ input:focus,select:focus{border-color:#88c0d0}
 </div>
 <script>
 document.getElementById("scanBtn").onclick=async()=>{
-  const list=document.getElementById("wifiList");
-  list.innerHTML='<div style="font-size:12px;color:#88c0d0">Сканирование...</div>';
-  const r=await fetch("/scan.json",{cache:"no-store"});
-  const d=await r.json();
-  list.innerHTML="";
-  if(d.length===0){list.innerHTML='<div style="font-size:12px;color:#616e88">Сетей не найдено. Введите SSID вручную.</div>';return;}
-  d.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
-    const e=document.createElement("div");
-    e.className="wifi-item";
-    const sec=n.enc?"🔒":"🔓";
-    const bars=n.rssi>-55?"▂▄▆█":n.rssi>-70?"▂▄▆":n.rssi>-80?"▂▄":"▂";
-    e.innerHTML=sec+" "+bars+" <b>"+n.ssid+"</b><small>"+n.rssi+" dBm · "+n.ch+"</small>";
-    e.onclick=()=>{document.getElementById("ssid").value=n.ssid;list.innerHTML="";};
-    list.appendChild(e);
-  });
+  const button=document.getElementById("scanBtn"), list=document.getElementById("wifiList");
+  if(button.disabled) return;
+  button.disabled=true;
+  list.textContent="Сканирование...";
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),20000);
+  try {
+    const r=await fetch("/scan.json",{cache:"no-store",signal:controller.signal});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    list.innerHTML="";
+    if(!d.length){list.textContent="Сетей не найдено. Введите SSID вручную.";return;}
+    d.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+      const e=document.createElement("div");
+      e.className="wifi-item";
+      const sec=n.enc?"🔒":"🔓";
+      e.textContent=sec+" "+n.ssid+" · "+n.rssi+" dBm · "+n.ch;
+      e.onclick=()=>{document.getElementById("ssid").value=n.ssid;list.innerHTML="";};
+      list.appendChild(e);
+    });
+  } catch(error) {list.textContent="Ошибка сканирования: "+error.message;}
+  finally {clearTimeout(timeout);button.disabled=false;}
 };
 </script></body></html>
 )rawliteral";
