@@ -36,6 +36,16 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
 .sum-card .val.orange{color:#ffb86c}
 .sum-card .val.green{color:#50fa7b}
 
+.via-panel{max-width:1400px;margin:0 auto 18px;background:#121726;border:1px solid #252d46;border-radius:9px;padding:14px;box-sizing:border-box}
+.via-heading{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.via-title{font-size:12px;color:#81a1c1;text-transform:uppercase;letter-spacing:.4px}
+#viaRubTotal{font-size:16px;font-weight:700;color:#a3be8c;overflow-wrap:anywhere}
+.via-coins{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr));gap:10px;color:#8be9fd}
+.via-coin{min-width:0;padding:10px 12px;background:#0d1220;border:1px solid #252d46;border-radius:7px}
+.via-native{font-size:16px;font-weight:700;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.via-rub{font-size:13px;color:#a3be8c;margin-top:5px;overflow-wrap:anywhere}
+.via-footer{display:flex;justify-content:space-between;gap:6px 16px;flex-wrap:wrap;margin-top:10px;font-size:11px;color:#81a1c1}
+
 .grid{max-width:1400px;margin:0 auto;display:grid;grid-template-columns:repeat(auto-fit,minmax(540px,1fr));gap:16px}
 .card{background:#141a2b;border:1px solid #2a334d;border-radius:10px;padding:18px;box-shadow:0 4px 18px rgba(0,0,0,.3)}
 .card .title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
@@ -159,6 +169,13 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
   <div class="sum-card"><span class="lbl">Энергоэффективность</span><span class="val" id="sumEff">— J/TH</span></div>
   <div class="sum-card"><span class="lbl">В сети (Online)</span><span class="val green" id="sumOnline">0 / 0</span></div>
   <div class="sum-card"><span class="lbl">Макс. темп. чипов/БП</span><span class="val" id="sumMaxTemp">—</span></div>
+
+</section>
+
+<section class="via-panel" id="viaCard" style="display:none" aria-label="Баланс ViaBTC">
+  <div class="via-heading"><span class="via-title">Баланс ViaBTC</span><span id="viaRubTotal"></span></div>
+  <div class="via-coins" id="viaBalance">—</div>
+  <div class="via-footer"><span id="viaStatus"></span><span id="viaRubStatus"></span></div>
 </section>
 
 <div class="grid" id="cards"></div>
@@ -224,6 +241,7 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
           </select>
         </div>
         <div><label>IP адрес</label><input id="m_ip" placeholder="192.168.0.133" required></div>
+        <div><label>Оценка мощности, Вт (если API не передаёт; 0 = авто)</label><input id="m_power" type="number" min="0" max="100000" step="1" value="0"></div>
         <div><label>Порт API</label><input id="m_port" type="number" value="0" placeholder="0 = авто (4028 / 80)"></div>
         <div><label>Логин</label><input id="m_user" placeholder="root / admin"></div>
         <div><label>Пароль</label><input id="m_pass" type="text" placeholder="root / admin"><label style="display:block;font-size:11px;margin-top:6px"><input type="checkbox" id="m_clearpass" style="width:auto"> Сбросить сохранённый пароль</label></div>
@@ -236,6 +254,26 @@ body{background:#0a0e1a;color:#e5e9f0;min-height:100vh;padding:20px}
     </form>
 
     <div class="miner-list" id="minerList"></div>
+    <section style="margin-top:22px;border-top:1px solid #2a334d;padding-top:16px">
+      <h4>Баланс ViaBTC</h4>
+      <form onsubmit="event.preventDefault();saveVia();">
+        <label><input id="viaEnabled" type="checkbox" style="width:auto"> Показывать баланс в верхней панели</label>
+        <div class="grid2">
+          <div><label>Аккаунт / субаккаунт ViaBTC</label><input id="viaAccount" maxlength="128" autocomplete="off"></div>
+          <div><label>API Key</label><input id="viaKey" type="password" maxlength="256" autocomplete="new-password"></div>
+          <div><label>Secret Key (необязательно)</label><input id="viaSecret" type="password" maxlength="256" autocomplete="new-password"></div>
+        </div>
+        <p style="font-size:12px;color:#81a1c1">Обновление раз в минуту. Укажите точное имя аккаунта, которому принадлежит ключ. Добавьте внешний IP этой сети в IP whitelist ViaBTC. Для чтения баланса Secret Key не требуется и не отправляется. Пустое поле ключа сохраняет прежнее значение.</p>
+        <div style="margin:14px 0"><label>Монеты для отображения и общего баланса</label>
+          <div id="viaCoinChoices" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-top:8px"></div>
+          <p style="font-size:12px;color:#81a1c1">Снимите флажок, чтобы скрыть монету и исключить её из итога. Новые монеты включаются автоматически. Выбор применяется кнопкой «Сохранить ViaBTC».</p>
+        </div>
+        <label><input id="viaClear" type="checkbox" style="width:auto"> Удалить сохранённые ключи</label>
+        <button id="viaSave" class="btn primary" type="submit" disabled>Сохранить ViaBTC</button>
+        <div id="viaMessage" role="status" style="font-size:12px;margin-top:8px"></div>
+      </form>
+    </section>
+
     <section style="margin-top:22px;border-top:1px solid #2a334d;padding-top:16px">
       <h4 style="color:#88c0d0;margin-bottom:10px">🔐 Пароль веб-интерфейса</h4>
       <form id="webPasswordForm" onsubmit="event.preventDefault();changeWebPassword();">
@@ -358,6 +396,7 @@ function minerCardHTML(m,i){
     <div class="reboot-info" id="ri_${i}"></div>
   </div>
   <div class="last-update" id="lu_${i}"></div>
+  <div class="last-update" id="bu_${i}"></div>
 </div>`;
 }
 
@@ -372,6 +411,7 @@ async function refreshData(){
     if(r.status===401){location.reload();return}
     const d=await r.json();
     lastData=d;
+    renderVia(d.viabtc);
     document.getElementById("espIp").textContent=d.esp_ip||"-";
     document.getElementById("espRssi").textContent=d.esp_rssi||"-";
     document.getElementById("espUptime").textContent=fmtUptimeMs(d.uptime_ms);
@@ -395,6 +435,7 @@ async function refreshData(){
 
     let totalHash = 0, totalPower = 0, onlineCnt = 0, globalMaxTemp = 0;
     let effWeightedHash = 0, effWeightedPower = 0;
+    let hasEstimatedPower = false, hasUnknownPower = false;
     const espUptimeMs = d.uptime_ms || 0;
 
     d.list.forEach(s=>{
@@ -406,6 +447,8 @@ async function refreshData(){
         onlineCnt++;
         totalHash += curHash;
         totalPower += curPower;
+        hasEstimatedPower ||= !!s.power_estimated;
+        hasUnknownPower ||= !s.power_available;
         if (curHash > 0 && curPower > 0) {
           effWeightedHash += curHash;
           effWeightedPower += curPower;
@@ -456,16 +499,22 @@ async function refreshData(){
         document.getElementById("hsub2_"+i).textContent = s.rate_30m_th ? ("30m: " + Number(s.rate_30m_th).toFixed(2) + " TH/s") : "";
       }
 
-      document.getElementById("pw_"+i).textContent = fmtW(s.power_w);
+      document.getElementById("pw_"+i).textContent = (s.power_available ? (curPower.toLocaleString("ru-RU") + " W") : "—") + (s.power_estimated ? " (оценка)" : "");
       if (curPower > 0 && curHash > 0) {
         const jth = curPower / curHash;
-        document.getElementById("eff_"+i).textContent = jth.toFixed(1) + " J/TH";
+        document.getElementById("eff_"+i).textContent = jth.toFixed(1) + " J/TH" + (s.power_estimated ? " (оценка)" : "");
         document.getElementById("eff_"+i).style.color = "#50fa7b";
       } else {
         document.getElementById("eff_"+i).textContent = "";
       }
       document.getElementById("psub_"+i).textContent = s.freq_avg ? ("Частота: " + s.freq_avg + " MHz") : (s.psu_name ? ("БП: " + s.psu_name) : "Ваттметр не передан в API");
 
+      const boardsAge = s.boards_available ? Math.floor(((espUptimeMs - s.boards_last_update_ms) >>> 0) / 1000) : -1;
+      const boardsStale = !!s.boards_stale || boardsAge > 30;
+      const boardsLabel = document.getElementById("bu_"+i);
+      boardsLabel.textContent = boardsAge < 0 ? "Платы: данные не получены" :
+        "Платы: " + (boardsStale ? "⚠ устаревшие данные · " : "") + boardsAge + " сек назад";
+      boardsLabel.style.color = (boardsAge < 0 || boardsStale) ? "#f1fa8c" : "";
       // Температуры
       if (isWM && !s.chip_temp_max) {
         document.getElementById("tl1_"+i).textContent = "Датчики БП (t1 / t2)";
@@ -489,7 +538,7 @@ async function refreshData(){
         document.getElementById("bt_"+i).textContent = fmtT(s.board_temp, s.board_temp_max || s.board_temp);
         document.getElementById("tsub1_"+i).textContent = isWM && s.env_temp ? ("Впуск: "+s.env_temp+"°C · БП: "+(s.psu_temp2||0)+"°C") : "Рабочая норма чипов < 80°C";
         document.getElementById("tsub2_"+i).textContent = s.total_acn ? ("Всего активных чипов: " + s.total_acn) : "";
-        if (s.online && (s.chip_temp_max||0) > globalMaxTemp) globalMaxTemp = s.chip_temp_max;
+        if (s.online && !boardsStale && (s.chip_temp_max||0) > globalMaxTemp) globalMaxTemp = s.chip_temp_max;
         tempClass(document.getElementById("tb1_"+i), s.chip_temp_avg, s.chip_temp_max, 75, 85);
         tempClass(document.getElementById("tb2_"+i), s.board_temp, s.board_temp_max||s.board_temp, 65, 75);
       }
@@ -584,6 +633,9 @@ async function refreshData(){
     document.getElementById("sumHash").textContent = totalHash.toFixed(2) + " TH/s";
     document.getElementById("sumPower").textContent = totalPower > 0 ? (totalPower.toLocaleString("ru-RU") + " W") : "—";
     document.getElementById("sumEff").textContent = (effWeightedHash > 0 && effWeightedPower > 0) ? ((effWeightedPower / effWeightedHash).toFixed(1) + " J/TH") : "— J/TH";
+    const powerNote = hasUnknownPower ? " (неполные данные)" : (hasEstimatedPower ? " (оценка)" : "");
+    document.getElementById("sumPower").textContent += powerNote;
+    document.getElementById("sumEff").textContent += powerNote;
     document.getElementById("sumOnline").textContent = `${onlineCnt} / ${d.list.length}`;
     document.getElementById("sumMaxTemp").textContent = globalMaxTemp > 0 ? (globalMaxTemp + " °C") : "—";
     document.getElementById("sumMaxTemp").style.color = globalMaxTemp >= 85 ? "#ff5555" : (globalMaxTemp >= 75 ? "#f1fa8c" : "#50fa7b");
@@ -675,7 +727,98 @@ async function changeLogFilter(){
   finally{select.disabled=false;}
 }
 
-function openSettings(){document.getElementById("settingsModal").classList.add("show");renderMinerList();}
+// Public quotes only: never send account names, balances or ViaBTC credentials.
+const viaCoinIds={BTC:"bitcoin",FB:"fractal-bitcoin",NMC:"namecoin",USDT:"tether",LTC:"litecoin",DOGE:"dogecoin",BCH:"bitcoin-cash",XEC:"ecash",DASH:"dash",ZEC:"zcash",ZEN:"zencash",ETC:"ethereum-classic",KAS:"kaspa",CKB:"nervos-network",ETH:"ethereum"};
+const rubQuotes={};
+let rubAttempt=0,rubBusy=false,rubError="",rubLastVia=null;
+const rubFormat=new Intl.NumberFormat("ru-RU",{style:"currency",currency:"RUB",maximumFractionDigits:2});
+function rubMoney(n){return n>0&&n<0.01?"< 0,01 ₽":rubFormat.format(n);}
+async function updateRubQuotes(v){
+  if(!v?.enabled||!v.valid||rubBusy||Date.now()-rubAttempt<300000)return;
+  const ids=[...new Set(selectedViaBalances(v).map(x=>viaCoinIds[x.coin]).filter(Boolean))];
+  if(!ids.length)return;
+  rubBusy=true;rubAttempt=Date.now();
+  const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),12000);
+  try{
+    const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids="+encodeURIComponent(ids.join(","))+"&vs_currencies=rub&include_last_updated_at=true",{signal:ctrl.signal,credentials:"omit",referrerPolicy:"no-referrer"});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const d=await r.json();let count=0;
+    for(const id of ids){
+      const q=d[id];
+      if(q&&typeof q.rub==="number"&&Number.isFinite(q.rub)&&q.rub>0&&Number.isFinite(q.last_updated_at)&&q.last_updated_at>0&&q.last_updated_at*1000<=Date.now()+300000){
+        rubQuotes[id]={price:q.rub,time:q.last_updated_at*1000};++count;
+      }
+    }
+    if(!count)throw new Error("Нет котировок");
+    rubError="";
+  }catch(e){rubError="Курсы недоступны"+(e.message.startsWith("HTTP")?": "+e.message:"");}
+  finally{clearTimeout(timer);rubBusy=false;if(rubLastVia)renderVia(rubLastVia,false);}
+}
+function selectedViaBalances(v){
+  const excluded=new Set(v?.excluded_coins||[]);
+  return (v?.balances||[]).filter(x=>!excluded.has(x.coin));
+}
+function renderVia(v,requestQuotes=true){
+  rubLastVia=v;
+  document.getElementById("viaCard").style.display=v?.enabled?"block":"none";
+  const value=document.getElementById("viaBalance"), status=document.getElementById("viaStatus");
+  let total=0,priced=0,missing=0,old=false;
+  const coinCell=(native,rub)=>`<div class="via-coin"><div class="via-native">${escapeHTML(native)}</div><div class="via-rub">${escapeHTML(rub)}</div></div>`;
+  const selected=selectedViaBalances(v);
+  value.innerHTML=v?.valid?(selected.length?selected.map(x=>{
+    const amount=Number(x.amount),q=rubQuotes[viaCoinIds[x.coin]],native=x.amount+" "+x.coin;
+    if(!Number.isFinite(amount)||amount<0){++missing;return coinCell(native,"— ₽");}
+    if(amount===0){++priced;return coinCell(native,"≈ "+rubMoney(0));}
+    if(!q){++missing;return coinCell(native,"Курс недоступен");}
+    const stale=Date.now()-q.time>900000;
+    old=old||stale;++priced;total+=amount*q.price;
+    return coinCell(native,"≈ "+rubMoney(amount*q.price)+(stale?" *":""));
+  }).join(""):(v.balances.length?"Все монеты скрыты — выберите их в настройках":"Нет балансов")):"—";
+  value.style.color=v?.stale?"#ebcb8b":"";
+  status.textContent=!v?.enabled?"":(v.error || (v.stale?"Устаревшие данные":"Баланс обновлён "+v.age_s+" с назад"));
+  document.getElementById("viaRubTotal").textContent=v?.valid&&priced?(missing?"Частично: ≈ ":"Всего: ≈ ")+rubMoney(total)+(old||v.stale?" (устарело)":""):"";
+  document.getElementById("viaRubStatus").textContent=!v?.enabled?"":[
+    "Курсы: CoinGecko · каждые 5 мин",
+    old?"* Котировка старше 15 минут":"",
+    missing?"Не все монеты оценены":"",rubError
+  ].filter(Boolean).join(" · ");
+  if(requestQuotes)void updateRubQuotes(v);
+}
+async function loadVia(){
+  const button=document.getElementById("viaSave");button.disabled=true;
+  try{
+    const r=await apiFetch("/api/viabtc",{cache:"no-store"}), d=await r.json();
+    document.getElementById("viaEnabled").checked=d.enabled;
+    document.getElementById("viaAccount").value=d.account||"";
+    for(const [id,has] of [["viaKey",d.has_api_key],["viaSecret",d.has_secret_key]]){
+      const input=document.getElementById(id);input.value="";input.placeholder=has?"Сохранён; оставьте пустым для сохранения":"Не задан";
+    }
+    const excluded=new Set(d.excluded_coins||[]);
+    const coins=[...new Set([...(d.coins||[]),...Object.keys(viaCoinIds),...excluded])];
+    const choices=document.getElementById("viaCoinChoices");choices.replaceChildren();
+    for(const coin of coins){
+      const label=document.createElement("label"),input=document.createElement("input");
+      input.type="checkbox";input.value=coin;input.checked=!excluded.has(coin);input.style.width="auto";
+      label.append(input,document.createTextNode(" "+coin));choices.append(label);
+    }
+    document.getElementById("viaClear").checked=false;
+    document.getElementById("viaMessage").textContent="";button.disabled=false;
+  }catch(e){document.getElementById("viaMessage").textContent=e.message;}
+}
+async function saveVia(){
+  const button=document.getElementById("viaSave");button.disabled=true;
+  try{
+    await apiFetch("/api/viabtc",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      enabled:document.getElementById("viaEnabled").checked,account:document.getElementById("viaAccount").value.trim(),
+      api_key:document.getElementById("viaKey").value.trim(),secret_key:document.getElementById("viaSecret").value.trim(),clear_keys:document.getElementById("viaClear").checked,
+      excluded_coins:[...document.querySelectorAll("#viaCoinChoices input")].filter(x=>!x.checked).map(x=>x.value)
+    })});
+    await loadVia();document.getElementById("viaMessage").textContent="Сохранено. Баланс обновится автоматически.";await refresh();
+  }catch(e){document.getElementById("viaMessage").textContent=e.message;}
+  finally{button.disabled=false;}
+}
+
+function openSettings(){document.getElementById("settingsModal").classList.add("show");renderMinerList();loadVia();}
 function closeSettings(){document.getElementById("settingsModal").classList.remove("show");}
 
 let s_logTimer = null;
@@ -718,6 +861,7 @@ function resetMinerForm(){
   ["m_idx","m_name","m_ip","m_user","m_pass"].forEach(id=>document.getElementById(id).value=id=="m_idx"?"-1":"");
   document.getElementById("m_type").value="1";
   document.getElementById("m_port").value="0";
+  document.getElementById("m_power").value="0";
   document.getElementById("m_pass").placeholder="Пароль майнера";
   document.getElementById("m_clearpass").checked=false;
   document.getElementById("m_delbtn").style.display="none";
@@ -729,6 +873,7 @@ function fillMinerForm(cfgItem,idx){
   document.getElementById("m_type").value=cfgItem.type||1;
   document.getElementById("m_ip").value=cfgItem.ip||"";
   document.getElementById("m_port").value=cfgItem.port||0;
+  document.getElementById("m_power").value=cfgItem.estimated_power_w||0;
   document.getElementById("m_user").value=cfgItem.user||"";
   document.getElementById("m_pass").value="";
   document.getElementById("m_pass").placeholder=cfgItem.has_pass?"Оставьте пустым, чтобы сохранить пароль":"Пароль не задан";
@@ -742,9 +887,11 @@ async function saveMinerForm(){
     type:parseInt(document.getElementById("m_type").value),
     ip:document.getElementById("m_ip").value.trim(),
     port:Number(document.getElementById("m_port").value||"0"),
+    estimated_power_w:Number(document.getElementById("m_power").value||"0"),
     user:document.getElementById("m_user").value,
     pass:document.getElementById("m_pass").value
   };
+  if(!Number.isInteger(d.estimated_power_w)||d.estimated_power_w<0||d.estimated_power_w>100000) {alert("Оценка мощности: целое число 0–100000 Вт");return;}
   const octets=d.ip.split(".");
   if(octets.length!==4 || octets.some(x=>!/^\d{1,3}$/.test(x)||Number(x)>255)) {alert("Введите корректный IPv4");return;}
   if(!Number.isInteger(d.port)||d.port<0||d.port>65535) {alert("Порт: 0–65535");return;}

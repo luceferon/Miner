@@ -17,6 +17,7 @@
 #include <ElegantOTA.h>
 #include <ESPmDNS.h>
 #include <WiFiClientSecure.h>
+#include <time.h>
 
 /* ======================================================================== */
 /*  DEFS                                                                    */
@@ -53,6 +54,8 @@ public:
 static __attribute__((aligned(4))) char s_logRing[LOG_RING_SIZE];
 static size_t s_logHead = 0, s_logTail = 0;
 static uint64_t s_logDropped = 0;
+static uint64_t s_logWritten = 0;
+static uint32_t s_logEpoch = 0;
 static int s_logMinerFilter = -1;
 
 static void logPushUnlocked(uint8_t c) {
@@ -63,6 +66,7 @@ static void logPushUnlocked(uint8_t c) {
   }
   s_logRing[s_logHead] = (char)c;
   s_logHead = next;
+  ++s_logWritten;
 }
 static void logWriteUnlocked(const uint8_t* bytes, size_t size) {
   for (size_t i = 0; i < size; ++i) logPushUnlocked(bytes[i]);
@@ -79,43 +83,53 @@ static void logClear() {
   LockGuard lock(logMutex);
   s_logHead = s_logTail = 0;
   s_logDropped = 0;
+  s_logWritten = 0;
+  ++s_logEpoch;
 }
 
+// Capture a bounded byte range; never hold logMutex during network writes.
+// If the writer overtakes this reader, stop explicitly rather than mix generations.
 static void logStreamToClient(bool includeBom) {
-  LockGuard lock(logMutex);
-  if (includeBom) {
-    server.sendContent("\xEF\xBB\xBF", 3);
+  uint64_t cursor, end, dropped;
+  uint32_t epoch;
+  size_t retained;
+  int filter;
+  {
+    LockGuard lock(logMutex);
+    retained = (s_logHead + LOG_RING_SIZE - s_logTail) % LOG_RING_SIZE;
+    end = s_logWritten;
+    cursor = end - retained;
+    dropped = s_logDropped;
+    epoch = s_logEpoch;
+    filter = s_logMinerFilter;
+    while (cursor < end && (((uint8_t)s_logRing[cursor % LOG_RING_SIZE] & 0xC0) == 0x80)) ++cursor;
   }
+  if (includeBom) server.sendContent("\xEF\xBB\xBF", 3);
   char header[240];
   int hlen = snprintf(header, sizeof(header),
       "# Log: 64 KiB; retained=%u bytes; overwritten=%llu bytes; miner_filter=%d (-1=all)\n"
       "# Oldest entry may be partial when overwritten > 0. Times are ESP uptime.\n",
-      (unsigned)((s_logHead + LOG_RING_SIZE - s_logTail) % LOG_RING_SIZE),
-      (unsigned long long)s_logDropped, s_logMinerFilter);
-  if (hlen > 0) {
-    server.sendContent(header, (size_t)hlen);
-  }
-
-  size_t h = s_logHead, t = s_logTail;
-  while (t != h && (((uint8_t)s_logRing[t] & 0xC0) == 0x80)) {
-    t = (t + 1) % LOG_RING_SIZE;
-  }
-
-  auto sendChunkedBuf = [](const char* ptr, size_t len) {
-    const size_t CHUNK = 2048;
-    while (len > 0) {
-      size_t n = (len > CHUNK) ? CHUNK : len;
-      server.sendContent(ptr, n);
-      ptr += n;
-      len -= n;
+      (unsigned)retained, (unsigned long long)dropped, filter);
+  if (hlen > 0) server.sendContent(header, (size_t)hlen < sizeof(header) ? (size_t)hlen : sizeof(header)-1);
+  char chunk[1024];
+  while (cursor < end && server.client().connected()) {
+    size_t n = 0;
+    bool lost = false;
+    {
+      LockGuard lock(logMutex);
+      size_t available = (s_logHead + LOG_RING_SIZE - s_logTail) % LOG_RING_SIZE;
+      lost = epoch != s_logEpoch || cursor < s_logWritten - available;
+      if (!lost) {
+        n = (end - cursor > sizeof(chunk)) ? sizeof(chunk) : (size_t)(end - cursor);
+        for (size_t i = 0; i < n; ++i) chunk[i] = s_logRing[(cursor + i) % LOG_RING_SIZE];
+      }
     }
-  };
-
-  if (h > t) {
-    sendChunkedBuf(s_logRing + t, h - t);
-  } else if (h < t) {
-    sendChunkedBuf(s_logRing + t, LOG_RING_SIZE - t);
-    if (h > 0) sendChunkedBuf(s_logRing, h);
+    if (lost) {
+      server.sendContent("\n# Log changed/overwritten during transfer; refresh to read newer entries.\n");
+      break;
+    }
+    server.sendContent(chunk, n);
+    cursor += n;
   }
 }
 
@@ -186,11 +200,19 @@ struct MinerConfig {
   String    name = "";
   IPAddress ip;
   uint16_t  apiPort = 0;
+  uint32_t  estimatedPowerW = 0; // 0 = model fallback; API measurement takes priority
   String    user = "";
   String    pass = "";
 };
 
+struct ViaConfig {
+  bool enabled = false;
+  String account, apiKey, secretKey;
+  String excludedCoins = "[]";
+};
+
 struct AppConfig {
+  ViaConfig via;
   WiFiConfig wifi;
   String     webUser = DEFAULT_WEB_USER;
   String     webPass = DEFAULT_WEB_PASS;
@@ -199,6 +221,11 @@ struct AppConfig {
 
 static void cfgSave() {
   prefs.begin("minerctl", false);
+  prefs.putBool("v_enable", cfg.via.enabled);
+  prefs.putString("v_account", cfg.via.account);
+  prefs.putString("v_api", cfg.via.apiKey);
+  prefs.putString("v_secret", cfg.via.secretKey);
+  prefs.putString("v_excluded", cfg.via.excludedCoins);
   prefs.putBool("w_cfg", cfg.wifi.configured);
   prefs.putString("w_ssid", cfg.wifi.ssid);
   prefs.putString("w_pass", cfg.wifi.password);
@@ -221,6 +248,7 @@ static void cfgSave() {
     uint32_t ip = m.ip;
     String kip = kp + "ip"; prefs.putUInt(kip.c_str(), ip);
     String kpo = kp + "p";  prefs.putUShort(kpo.c_str(), m.apiPort);
+    String kew = kp + "ew"; prefs.putUInt(kew.c_str(), m.estimatedPowerW);
     String kusr = kp+"usr"; prefs.putString(kusr.c_str(), m.user);
     String kpwd = kp+"pwd"; prefs.putString(kpwd.c_str(), m.pass);
   }
@@ -230,6 +258,11 @@ static void cfgSave() {
 
 static void cfgLoad() {
   prefs.begin("minerctl", true);
+  cfg.via.enabled = prefs.getBool("v_enable", false);
+  cfg.via.account = prefs.getString("v_account", "");
+  cfg.via.apiKey = prefs.getString("v_api", "");
+  cfg.via.secretKey = prefs.getString("v_secret", "");
+  cfg.via.excludedCoins = prefs.getString("v_excluded", "[]");
   cfg.wifi.configured = prefs.getBool("w_cfg", false);
   cfg.wifi.ssid       = prefs.getString("w_ssid", "");
   cfg.wifi.password   = prefs.getString("w_pass", "");
@@ -258,6 +291,7 @@ static void cfgLoad() {
     String kn = kp + "n";   m.name    = prefs.getString(kn.c_str(), String(""));
     String kip = kp + "ip"; m.ip      = (uint32_t)prefs.getUInt(kip.c_str(), 0);
     String kpo = kp + "p";  m.apiPort = prefs.getUShort(kpo.c_str(), 0);
+    String kew = kp + "ew"; m.estimatedPowerW = prefs.getUInt(kew.c_str(), 0);
     String kusr = kp+"usr"; m.user    = prefs.getString(kusr.c_str(), String(""));
     String kpwd = kp+"pwd"; m.pass    = prefs.getString(kpwd.c_str(), String(""));
   }
@@ -313,6 +347,10 @@ struct MinerStatus {
   uint16_t  avgBoardTempC = 0;
   uint16_t  maxBoardTempC = 0;
   uint32_t  powerW = 0;
+  bool      powerEstimated = false;
+  bool      powerReported = false;
+  uint32_t  boardsLastUpdate = 0;
+  bool      boardsFresh = false;
   uint32_t  voltage_mV = 0;
   uint32_t  current_mA = 0;
   uint16_t  fanRpm[4] = {0,0,0,0};
@@ -374,6 +412,18 @@ public:
   }
   ~MinerSnapshot() {
     if (!publish) return;
+    // Apply estimates only after all parsers have identified the model.
+    if (!reboot && status.online && !status.powerReported) {
+      uint32_t estimate = config.estimatedPowerW;
+      String model = status.minerModel;
+      model.toUpperCase();
+      if (!estimate && !status.isWhatsminer) {
+        if (model.indexOf("S19I") >= 0) estimate = 3100;
+        else if (model == "ANTMINER S19" || model == "S19") estimate = 3250;
+      }
+      status.powerW = estimate;
+      status.powerEstimated = estimate > 0;
+    }
     LockGuard lock(stateMutex);
     if (generation != minerGeneration[idx]) return;
     if (reboot) {
@@ -561,6 +611,10 @@ static bool parseAntSummary(const String& json, MinerStatus& o) {
     hv = tryRate("Rate 24h"); if (hv >= 0) o.hashrateTHs   = hv; else
     o.hashrateTHs = o.hashrateAvgTHs;
 
+    o.powerReported = !s["Power"].isNull() || !s["Power Input"].isNull() ||
+      !s["Power Consumption"].isNull() || !s["Power Scrypt"].isNull() ||
+      !s["Input power"].isNull() || !s["Input Power"].isNull() ||
+      !s["Power consumption"].isNull() || !s["power"].isNull() || !s["wattage"].isNull();
     if (s.containsKey("Power"))               o.powerW = s["Power"];
     else if (s.containsKey("Power Input"))    o.powerW = s["Power Input"];
     else if (s.containsKey("Power Consumption")) o.powerW = s["Power Consumption"];
@@ -571,17 +625,6 @@ static bool parseAntSummary(const String& json, MinerStatus& o) {
     else if (s.containsKey("power"))          o.powerW = s["power"];
     else if (s.containsKey("wattage"))        o.powerW = s["wattage"];
     else o.powerW = 0;
-
-    // >>> Фоллбэк на паспортную мощность из документации, если API не вернул ватты <<<
-    if (o.powerW == 0) {
-      String mModel = o.minerModel;
-      mModel.toUpperCase();
-      if (mModel.indexOf("S19I") >= 0) {
-        o.powerW = 3100; // Antminer S19i из документации
-      } else {
-        o.powerW = 3250; // Antminer S19 по умолчанию
-      }
-    }
 
     o.uptimeSec      = s["Elapsed"] | s["Elapsed (secs)"] | 0;
     o.acceptedShares = s["Accepted"] | s["accepted"] | 0;
@@ -621,7 +664,10 @@ static bool parseAntSummary(const String& json, MinerStatus& o) {
       if (s.containsKey("PSU Iout")) o.psuIout = s["PSU Iout"].as<double>();
       if (s.containsKey("PSU Iin0")) o.psuIin0 = s["PSU Iin0"].as<double>();
 
-      if (s.containsKey("Power Realtime")) o.powerW = s["Power Realtime"].as<uint32_t>();
+      if (!s["Power Realtime"].isNull()) {
+        o.powerW = s["Power Realtime"].as<uint32_t>();
+        o.powerReported = true;
+      }
 
       if (s.containsKey("MHS av")) {
         double v = s["MHS av"].as<double>();
@@ -704,7 +750,8 @@ static bool parseAntStats(const String& json, MinerStatus& o) {
     }
   }
 
-  if (chipCnt > 0) { o.avgChipTempC = chipSum / chipCnt; o.maxChipTempC = chipMax; }
+  if (chipCnt > 0) o.avgChipTempC = chipSum / chipCnt;
+  o.maxChipTempC = chipMax;
   if (pcbCnt > 0)  { o.avgBoardTempC = pcbSum / pcbCnt;  o.maxBoardTempC = pcbMax; }
 
   // Извлечение телеметрии по каждой из 4 хеш-плат
@@ -737,6 +784,8 @@ static bool parseAntStats(const String& json, MinerStatus& o) {
     String acs  = obj[kAcs] | "";
     ci.badAsic  = (acs.indexOf('x') >= 0 || acs.indexOf('X') >= 0 || acs.indexOf('-') >= 0);
   }
+  o.boardsFresh = o.chainCount > 0;
+  if (o.boardsFresh) o.boardsLastUpdate = millis();
   return true;
 }
 
@@ -778,27 +827,27 @@ static bool parseWhatsDevs(const String& json, MinerStatus& o) {
     // Проверяем поля со строковым диапазоном вида "58°→86°C" или отдельные числовые ключи
     if (dv["Chip Temp"].is<const char*>()) {
       String tStr = dv["Chip Temp"].as<const char*>();
-      int arrow = tStr.indexOf('→');
+      int arrow = tStr.indexOf("→");
       if (arrow > 0) {
         tChipCurrent = tStr.substring(0, arrow).toInt();
-        tChipPeak    = tStr.substring(arrow + 1).toInt();
+        tChipPeak    = tStr.substring(arrow + strlen("→")).toInt();
       } else {
         tChipCurrent = tStr.toInt();
         tChipPeak    = tChipCurrent;
       }
     } else {
-      tChipCurrent = dv["Chip Temp Min"] | dv["Chip Temp Avg"] | dv["Chip Temp"] | 0;
+      tChipCurrent = dv["Chip Temp Avg"] | dv["Chip Temp"] | 0;
       tChipPeak    = dv["Chip Temp Max"] | tChipCurrent;
     }
 
     int tBoard = (int)(dv["Temperature"] | dv["Temp"] | dv["PCB Temp"] | 0.0);
 
-    // Учитываем для средних/максимальных показателей по майнеру именно ПЕРВОЕ (текущее) число
+    // Среднее по платам и максимум чипов считаются независимо.
     if (tChipCurrent > 0) {
       chipSum += tChipCurrent;
       chipCnt++;
-      if ((uint32_t)tChipCurrent > chipMax) chipMax = (uint32_t)tChipCurrent;
     }
+    if (tChipPeak > 0 && (uint32_t)tChipPeak > chipMax) chipMax = (uint32_t)tChipPeak;
     if (tBoard > 0) {
       pcbSum += tBoard;
       pcbCnt++;
@@ -826,9 +875,12 @@ static bool parseWhatsDevs(const String& json, MinerStatus& o) {
     }
   }
 
-  if (chipCnt > 0) { o.avgChipTempC = chipSum / chipCnt; o.maxChipTempC = chipMax; }
+  if (chipCnt > 0) o.avgChipTempC = chipSum / chipCnt;
+  o.maxChipTempC = chipMax;
   if (pcbCnt > 0)  { o.avgBoardTempC = pcbSum / pcbCnt;  o.maxBoardTempC = pcbMax; }
-  return o.chainCount > 0;
+  o.boardsFresh = o.chainCount > 0;
+  if (o.boardsFresh) o.boardsLastUpdate = millis();
+  return o.boardsFresh;
 }
 
 static bool parseAntPools(const String& json, MinerStatus& o) {
@@ -1453,6 +1505,7 @@ static bool parseWhatsStatus(const String& json, MinerStatus& o) {
     o.hashrate5sTHs = x["hashrate_5s_th"] | o.hashrateTHs;
     o.hashrateAvgTHs = x["hashrate_avg_th"] | o.hashrateTHs;
     o.powerW = x["power_w"] | x["power"] | 0;
+    o.powerReported = !x["power_w"].isNull() || !x["power"].isNull();
     o.voltage_mV = x["voltage_mv"] | 0;
     o.current_mA = x["current_ma"] | 0;
     o.uptimeSec = x["uptime_sec"] | 0;
@@ -1481,6 +1534,7 @@ static bool parseWhatsStatus(const String& json, MinerStatus& o) {
     o.hashrate5sTHs = d["hashrate_5s_th"] | o.hashrateTHs;
     o.hashrateAvgTHs = d["hashrate_avg_th"] | o.hashrateTHs;
     o.powerW = d["power"] | 0;
+    o.powerReported = !d["power"].isNull();
     o.status = d["status"] | "Unknown";
   }
   return true;
@@ -1557,6 +1611,7 @@ static void pollMiner(uint8_t idx) {
 
   // Сохраняем данные плат с прошлого успешного опроса на случай пропуска пакета devs/stats
   uint32_t previousUpdate   = s.lastUpdate;
+  uint32_t previousBoardsUpdate = s.boardsLastUpdate;
   uint8_t  prevChainCount   = s.chainCount;
   uint16_t prevTotalAcn     = s.totalAcn;
   uint16_t prevAvgChipTemp  = s.avgChipTempC;
@@ -1613,6 +1668,7 @@ static void pollMiner(uint8_t idx) {
 
     // Восстанавливаем кэш плат из предыдущего цикла, если текущий опрос плат не вернул данные
     if (s.online && s.chainCount == 0 && prevChainCount > 0) {
+      s.boardsLastUpdate = previousBoardsUpdate;
       s.chainCount    = prevChainCount;
       s.totalAcn      = prevTotalAcn;
       s.avgChipTempC  = prevAvgChipTemp;
@@ -1648,6 +1704,7 @@ static void pollMiner(uint8_t idx) {
 
       // Восстанавливаем кэш плат из предыдущего цикла, если devs пропустил пакет
       if (s.online && s.chainCount == 0 && prevChainCount > 0) {
+        s.boardsLastUpdate = previousBoardsUpdate;
         s.chainCount    = prevChainCount;
         s.totalAcn      = prevTotalAcn;
         s.avgChipTempC  = prevAvgChipTemp;
@@ -1694,6 +1751,7 @@ static void pollMiner(uint8_t idx) {
 
     // Восстанавливаем кэш плат для HTTP режима, если нужно
     if (s.online && s.chainCount == 0 && prevChainCount > 0) {
+      s.boardsLastUpdate = previousBoardsUpdate;
       s.chainCount    = prevChainCount;
       s.totalAcn      = prevTotalAcn;
       s.avgChipTempC  = prevAvgChipTemp;
@@ -1936,6 +1994,284 @@ static void scanNetworkTask(void* param) {
 /* ======================================================================== */
 #include "index_html.h"
 
+// ViaBTC read-only account API. No signature or Secret Key required by this endpoint.
+static const char VIA_CA[] PROGMEM = R"PEM(
+-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICPzCCAcWgAwIBAgIQBVVWvPJepDU1w6QP1atFcjAKBggqhkjOPQQDAzBhMQsw
+CQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cu
+ZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBHMzAe
+Fw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVTMRUw
+EwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20x
+IDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEczMHYwEAYHKoZIzj0CAQYF
+K4EEACIDYgAE3afZu4q4C/sLfyHS8L6+c/MzXRq8NOrexpu80JX28MzQC7phW1FG
+fp4tn+6OYwwX7Adw9c+ELkCDnOg/QW07rdOkFFk2eJ0DQ+4QE2xy3q6Ip6FrtUPO
+Z9wj/wMco+I+o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAd
+BgNVHQ4EFgQUs9tIpPmhxdiuNkHMEWNpYim8S8YwCgYIKoZIzj0EAwMDaAAwZQIx
+AK288mw/EkrRLTnDCgmXc/SINoyIJ7vmiI1Qhadj+Z4y3maTD/HMsQmP3Wyr+mt/
+oAIwOWZbwmSNuJ5Q3KjVSaLtx9zRSX8XAbjIho9OjIgrqJqpisXRAL34VOKa5Vt8
+sycX
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPluILrIPglJ209ZjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjMwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjMwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AAQfTzOHMymKoYTey8chWEGJ6ladK0uFxh1MJ7x/JlFyb+Kf1qPKzEUURout736G
+jOyxfi//qXGdGIRFBEFVbivqJn+7kAHjSxm65FSWRQmx1WyRRK2EE46ajA2ADDL2
+4CejQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBTB8Sa6oC2uhYHP0/EqEr24Cmf9vDAKBggqhkjOPQQDAwNpADBmAjEA9uEglRR7
+VKOQFhG/hMjqb2sXnh5GmCCbn9MN2azTL818+FsuVbu/3ZL3pAzcMeGiAjEA/Jdm
+ZuVDFhOD3cffL74UOO0BzrEXGhF16b0DjyZ+hOXJYKaV11RZt+cRLInUue4X
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+)PEM";
+static uint32_t viaRevision = 1, viaUpdated = 0;
+static String viaBalances = "[]", viaError = "Ожидание обновления";
+static bool viaValid = false, viaWorkerReady = false;
+
+// HTTPClient decodes chunked transfer; cap the decoded body before parsing.
+class ViaBody : public Stream {
+public:
+  String body;
+  bool overflow = false;
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* data, size_t len) override {
+    if (body.length() + len > 16384) { overflow = true; return 0; }
+    return body.concat((const char*)data, (unsigned int)len) ? len : 0;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+};
+static bool viaDecimal(const String& s) {
+  if (!s.length() || s.length() > 64) return false;
+  bool dot = false, digit = false;
+  for (size_t i=0; i<s.length(); ++i) {
+    if (s[i] == '.' && !dot) dot = true;
+    else if (s[i] >= '0' && s[i] <= '9') digit = true;
+    else return false;
+  }
+  return digit;
+}
+static void viaTask(void*) {
+  uint32_t revision = 0, attempted = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ViaConfig c; uint32_t rev;
+    { LockGuard lock(stateMutex); c = cfg.via; rev = viaRevision; }
+    if (!c.enabled) continue;
+    if (revision == rev && (uint32_t)(millis()-attempted) < 60000) continue;
+    revision = rev; attempted = millis();
+    String error, balances;
+    if (WiFi.status() != WL_CONNECTED) error = "Нет Wi-Fi";
+    else if (time(nullptr) < 1700000000) error = "Ожидание синхронизации времени (NTP)";
+    else if (ESP.getFreeHeap() < 70000 || ESP.getMaxAllocHeap() < 40000) error = "Недостаточно RAM для HTTPS";
+    else {
+      WiFiClientSecure client;
+      client.setCACert(VIA_CA);
+      client.setHandshakeTimeout(8);
+      HTTPClient http;
+      http.setConnectTimeout(5000);
+      http.setTimeout(8000);
+      http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+      if (!http.begin(client, "https://www.viabtc.net/res/openapi/v1/account")) error = "Не удалось начать HTTPS";
+      else {
+        http.addHeader("X-API-KEY", c.apiKey);
+        int code = http.GET();
+        if (code != 200) error = code < 0 ? "Ошибка HTTPS: сеть, время или сертификат" : "ViaBTC HTTP " + String(code);
+        else {
+          ViaBody body;
+          int received = http.writeToStream(&body);
+          JsonDocument d, filter;
+          filter["code"] = true;
+          filter["data"]["account"]["account"] = true;
+          filter["data"]["balance"][0]["coin"] = true;
+          filter["data"]["balance"][0]["amount"] = true;
+          if (received < 0 || body.overflow) error = "Ответ ViaBTC слишком большой или неполный";
+          else if (deserializeJson(d, body.body, DeserializationOption::Filter(filter))) error = "Некорректный JSON ViaBTC";
+          else if (!d["code"].is<int>()) error = "Неизвестный формат ответа ViaBTC";
+          else if (d["code"].as<int>() != 0) error = "ViaBTC API " + String(d["code"].as<int>()) + ": проверьте ключ и IP whitelist";
+          else if (c.account != (d["data"]["account"]["account"] | "")) error = "Аккаунт не соответствует API Key";
+          else if (!d["data"]["balance"].is<JsonArray>()) error = "В ответе ViaBTC нет списка балансов";
+          else {
+            JsonArray rows = d["data"]["balance"].as<JsonArray>();
+            if (rows.size() > 64) error = "Слишком много валют в ответе";
+            for (JsonObject row : rows) {
+              String coin = row["coin"] | "", amount = row["amount"] | "";
+              if (!coin.length() || coin.length() > 16 || !viaDecimal(amount)) { error = "Некорректный баланс ViaBTC"; break; }
+            }
+            if (!error.length()) serializeJson(rows, balances);
+          }
+        }
+        http.end();
+      }
+    }
+    { LockGuard lock(stateMutex);
+      if (rev != viaRevision) continue; // Never publish a result for replaced credentials.
+      viaError = error;
+      if (!error.length()) { viaBalances = balances; viaUpdated = millis(); viaValid = true; }
+    }
+  }
+}
+void handleViaConfig() {
+  if (!checkAuthOrBypass()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  LockGuard lock(stateMutex);
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("plain") || server.arg("plain").length() > 2048) { server.send(400,"text/plain","Invalid body"); return; }
+    JsonDocument d;
+    if (deserializeJson(d,server.arg("plain")) || !d["enabled"].is<bool>()) { server.send(400,"text/plain","Invalid JSON"); return; }
+    ViaConfig next = cfg.via;
+    if (!d["excluded_coins"].isNull()) {
+      if (!d["excluded_coins"].is<JsonArray>() || d["excluded_coins"].size()>64) { server.send(400,"text/plain","Invalid coin list"); return; }
+      for (JsonVariant item : d["excluded_coins"].as<JsonArray>()) {
+        String coin = item.is<const char*>() ? item.as<String>() : String("");
+        bool valid = coin.length()>0 && coin.length()<=16;
+        for (size_t i=0;i<coin.length();++i) if (!((coin[i]>='A'&&coin[i]<='Z')||(coin[i]>='0'&&coin[i]<='9')||coin[i]=='-'||coin[i]=='_')) valid=false;
+        if (!valid) { server.send(400,"text/plain","Invalid coin symbol"); return; }
+      }
+      next.excludedCoins=""; serializeJson(d["excluded_coins"],next.excludedCoins);
+    }
+
+    next.enabled = d["enabled"].as<bool>();
+    next.account = d["account"] | ""; next.account.trim();
+    String key = d["api_key"] | "", secret = d["secret_key"] | "";
+    key.trim(); secret.trim();
+    if (d["clear_keys"] | false) { next.apiKey = ""; next.secretKey = ""; }
+    if (key.length()) next.apiKey = key;
+    if (secret.length()) next.secretKey = secret;
+    bool invalid = next.account.length()>128 || next.apiKey.length()>256 || next.secretKey.length()>256;
+    for(size_t i=0;i<next.apiKey.length();++i) if(next.apiKey[i]<33 || next.apiKey[i]>126) invalid=true;
+    if (invalid || (next.enabled && (!next.account.length() || !next.apiKey.length()))) { server.send(400,"text/plain","Укажите аккаунт и API Key; проверьте длину полей"); return; }
+    bool credentialsChanged = next.enabled!=cfg.via.enabled || next.account!=cfg.via.account || next.apiKey!=cfg.via.apiKey || next.secretKey!=cfg.via.secretKey;
+    cfg.via = next; cfgSave();
+    if (credentialsChanged) {
+      ++viaRevision; viaBalances="[]"; viaValid=false; viaUpdated=0; viaError="Ожидание обновления";
+    }
+  }
+  JsonDocument d;
+  d["enabled"]=cfg.via.enabled; d["account"]=cfg.via.account;
+  JsonDocument excluded, available;
+  deserializeJson(excluded,cfg.via.excludedCoins); d["excluded_coins"].set(excluded.as<JsonArray>());
+  deserializeJson(available,viaBalances);
+  JsonArray coins=d["coins"].to<JsonArray>();
+  for(JsonObject row:available.as<JsonArray>()) coins.add(row["coin"]);
+  d["has_api_key"]=cfg.via.apiKey.length()>0; d["has_secret_key"]=cfg.via.secretKey.length()>0;
+  String out; serializeJson(d,out); server.send(200,"application/json",out);
+}
+
 void handleRoot() {
   if (!checkAuthOrBypass()) return;
   server.send_P(200, "text/html", INDEX_HTML);
@@ -1956,6 +2292,7 @@ void handleApiStatus() {
     o["type"] = (uint8_t)m.type;
     o["ip"]   = m.ip.toString();
     o["port"] = m.apiPort;
+    o["estimated_power_w"] = m.estimatedPowerW;
     o["name"] = m.name.length() ? m.name : String("Miner #") + String(i+1);
     bool connected = WiFi.status() == WL_CONNECTED;
     o["online"] = s.online && connected;
@@ -1971,6 +2308,11 @@ void handleApiStatus() {
     o["freq_avg"] = s.freqAvg;
     o["total_acn"] = s.totalAcn;
     o["power_w"] = s.powerW;
+    o["power_estimated"] = s.powerEstimated;
+    o["power_available"] = s.powerReported || s.powerEstimated;
+    o["boards_last_update_ms"] = s.boardsLastUpdate;
+    o["boards_available"] = s.chainCount > 0;
+    o["boards_stale"] = !connected || !s.online || !s.boardsFresh || (uint32_t)(millis() - s.boardsLastUpdate) > 30000;
     o["chip_temp_avg"] = s.avgChipTempC;
     o["chip_temp_max"] = s.maxChipTempC;
     o["board_temp"] = s.avgBoardTempC;
@@ -2038,6 +2380,18 @@ void handleApiStatus() {
       o["chip_temp_protect"] = s.chipTempProtectC;
     }
   }
+  {
+    LockGuard lock(stateMutex);
+    JsonObject v = doc["viabtc"].to<JsonObject>();
+    JsonDocument excluded; deserializeJson(excluded,cfg.via.excludedCoins);
+    v["excluded_coins"].set(excluded.as<JsonArray>());
+    v["enabled"] = cfg.via.enabled; v["account"] = cfg.via.account;
+    v["valid"] = viaValid;
+    v["stale"] = !viaValid || viaError.length()>0 || WiFi.status()!=WL_CONNECTED || (uint32_t)(millis()-viaUpdated)>120000;
+    v["age_s"] = viaValid ? (uint32_t)(millis()-viaUpdated)/1000 : 0;
+    v["error"] = viaWorkerReady ? viaError : String("Не удалось запустить задачу ViaBTC");
+    JsonDocument cached; deserializeJson(cached,viaBalances); v["balances"].set(cached.as<JsonArray>());
+  }
   doc["esp_ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : (isPortalMode ? WiFi.softAPIP().toString() : "");
   doc["esp_rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["uptime_ms"] = millis();
@@ -2060,6 +2414,7 @@ void handleApiConfig() {
     o["name"] = m.name;
     o["ip"]   = m.ip.toString();
     o["port"] = m.apiPort;
+    o["estimated_power_w"] = m.estimatedPowerW;
     o["user"] = m.user;
     o["has_pass"] = m.pass.length() > 0;
   }
@@ -2083,6 +2438,10 @@ void handleApiMinerSave() {
       (!d["pass"].isNull() && !d["pass"].is<const char*>())) {
     server.send(400, "text/plain", "invalid fields"); return;
   }
+  if (!d["estimated_power_w"].isNull() &&
+      (!d["estimated_power_w"].is<uint32_t>() || d["estimated_power_w"].as<uint32_t>() > 100000)) {
+    server.send(400, "text/plain", "estimated_power_w: integer 0..100000"); return;
+  }
   int idx = d["idx"].as<int>(), type = d["type"].as<int>(), port = d["port"].as<int>();
   IPAddress ip;
   String name = d["name"], user = d["user"], pass = d["pass"] | "";
@@ -2097,6 +2456,7 @@ void handleApiMinerSave() {
   MinerConfig& m = cfg.miners[idx];
   m.inUse = true; m.type = (MinerType)type; m.name = name;
   m.ip = ip; m.apiPort = port; m.user = user;
+  if (!d["estimated_power_w"].isNull()) m.estimatedPowerW = d["estimated_power_w"].as<uint32_t>();
   if (d["pass"].is<const char*>()) m.pass = pass;
   ++minerGeneration[idx];
   minerState[idx] = MinerStatus();
@@ -2297,6 +2657,9 @@ void setup() {
     return;
   }
 
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  viaWorkerReady = xTaskCreate(viaTask, "viaBTC", 8192, NULL, 1, NULL) == pdPASS;
+
   ArduinoOTA.setHostname("miner-control");
   ArduinoOTA.setPassword(cfg.webPass.c_str());
   ArduinoOTA.begin();
@@ -2304,6 +2667,8 @@ void setup() {
 
   server.on("/",               handleRoot);
   server.on("/api/status",     HTTP_GET,  handleApiStatus);
+  server.on("/api/viabtc", HTTP_GET, handleViaConfig);
+  server.on("/api/viabtc", HTTP_POST, handleViaConfig);
   server.on("/api/config",     HTTP_GET,  handleApiConfig);
   server.on("/api/miner/save", HTTP_POST, handleApiMinerSave);
   server.on("/api/miner/delete", HTTP_POST, handleApiMinerDelete);
